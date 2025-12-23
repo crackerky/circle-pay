@@ -22,7 +22,7 @@ export default function CreateEvent() {
 
     try {
       const response = await getCircleMembers(accessToken);
-      setMembers(response.members);
+      setMembers(response?.members || []);
     } catch (error) {
       console.error('メンバー取得エラー:', error);
       setError('メンバー一覧の取得に失敗しました');

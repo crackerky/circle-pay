@@ -22,7 +22,7 @@ export default function EventsPage() {
     setIsLoadingData(true);
     try {
       const response = await getMyEvents(accessToken);
-      setEvents(response.events || []);
+      setEvents(response?.events || []);
     } catch (error) {
       console.error('イベント取得エラー:', error);
       setError('イベント一覧の取得に失敗しました');

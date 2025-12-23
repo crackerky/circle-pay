@@ -28,7 +28,16 @@ async function apiCall<T>(endpoint: string, options: ApiOptions): Promise<T> {
     throw new Error(`API Error: ${response.status} - ${errorText}`);
   }
 
-  return response.json();
+  const text = await response.text();
+  if (!text) {
+    return {} as T;
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error('Invalid JSON response');
+  }
 }
 
 // ========== ユーザー関連 ==========
