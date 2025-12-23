@@ -1,0 +1,1616 @@
+package main
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+)
+
+type ReceivedMessage struct {
+	Timestamp time.Time `json:"timestamp"`
+	UserID    string    `json:"userID"`
+	Text      string    `json:"text"`
+}
+
+var messages []ReceivedMessage
+var db *sql.DB
+
+// LINE Webhook用構造体
+type WebhookRequest struct {
+	Events []WebhookEvent `json:"events"`
+}
+
+type WebhookEvent struct {
+	Type       string  `json:"type"`
+	ReplyToken string  `json:"replyToken"`
+	Message    Message `json:"message"`
+	Source     Source  `json:"source"`
+}
+
+type Message struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type Source struct {
+	UserID string `json:"userId"`
+}
+
+// LINE Push API用構造体
+type PushRequest struct {
+	To       string `json:"to"`
+	Messages []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"messages"`
+}
+
+// LINE Reply API用構造体
+type ReplyRequest struct {
+	ReplyToken string `json:"replyToken"`
+	Messages   []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"messages"`
+}
+
+// ユーザー情報を管理する構造体
+type User struct {
+	UserID          string
+	Name            string
+	Circle          string
+	Step            int //0,未登録　1,名前待ち　2,サークル名前待ち 3,完了
+	SplitEventStep  int // 0:なし 1:イベント名待ち 2:金額待ち 3:参加者選択待ち
+	TempEventID     int // 作成中のイベントID
+	ApprovalStep    int // 0:なし 1:承認番号待ち
+	ApprovalEventID int // 承認中のイベントID
+}
+
+// 割り勘イベント情報を管理する構造体
+type Event struct {
+	ID           int
+	EventName    string
+	OrganizerID  string
+	Circle       string
+	TotalAmount  int
+	SplitAmount  int
+	Status       string // 'selecting' / 'confirmed' / 'completed'
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// イベント参加者情報を管理する構造体
+type Participant struct {
+	ID         int
+	EventID    int
+	UserID     string
+	UserName   string
+	Paid       bool
+	ReportedAt *time.Time
+	PaidAt     *time.Time
+	CreatedAt  time.Time
+}
+
+var users = make(map[string]*User)
+
+// データベース初期化
+func initDB() error { //error型は
+	var err error
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == ""{
+		return fmt.Errorf("DATABASE_URL is not set")
+	}
+
+	db, err = sql.Open("postgres", databaseURL)
+	if err != nil{
+		return fmt.Errorf("failed to open database")
+	}
+
+	// 接続確認
+	if err = db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err) //`%wの意味を探る`
+	}
+
+	log.Println("Database connected successfully")
+	return nil
+}
+
+//テーブル作成
+func createTables() error{
+	usersTable := `
+	CREATE TABLE IF NOT EXISTS users (
+	user_id TEXT PRIMARY KEY,
+	name TEXT,
+	circle TEXT,
+	step INTEGER NOT NULL,
+	split_event_step INTEGER DEFAULT 0,
+	temp_event_id INTEGER,
+	approval_step INTEGER DEFAULT 0,
+	approval_event_id INTEGER,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`
+
+	messagesTable := `
+	CREATE TABLE IF NOT EXISTS messages(
+	id SERIAL PRIMARY KEY,
+	user_id TEXT NOT NULL,
+	text TEXT NOT NULL,
+	timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`
+
+	eventsTable := `
+	CREATE TABLE IF NOT EXISTS events (
+	id SERIAL PRIMARY KEY,
+	event_name TEXT NOT NULL,
+	organizer_id TEXT NOT NULL,
+	circle TEXT NOT NULL,
+	total_amount INTEGER NOT NULL,
+	split_amount INTEGER NOT NULL,
+	status TEXT NOT NULL,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`
+
+	participantsTable := `
+	CREATE TABLE IF NOT EXISTS event_participants (
+	id SERIAL PRIMARY KEY,
+	event_id INTEGER NOT NULL REFERENCES events(id),
+	user_id TEXT NOT NULL,
+	user_name TEXT NOT NULL,
+	paid BOOLEAN DEFAULT FALSE,
+	reported_at TIMESTAMP,
+	paid_at TIMESTAMP,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`
+
+	indexEvents := `
+	CREATE INDEX IF NOT EXISTS idx_events_organizer ON events(organizer_id);
+	CREATE INDEX IF NOT EXISTS idx_events_circle ON events(circle);`
+
+	indexParticipants := `
+	CREATE INDEX IF NOT EXISTS idx_participants_event ON event_participants(event_id);
+	CREATE INDEX IF NOT EXISTS idx_participants_user ON event_participants(user_id);`
+
+	if _, err :=db.Exec(usersTable); err != nil{
+		return fmt.Errorf("failed to create a user table: %w", err)
+	}
+
+	if _, err :=db.Exec(messagesTable) ; err != nil{
+		return fmt.Errorf("failed to create a messages table: %w", err)
+	}
+
+	if _, err :=db.Exec(eventsTable); err != nil{
+		return fmt.Errorf("failed to create events table: %w", err)
+	}
+
+	if _, err :=db.Exec(participantsTable); err != nil{
+		return fmt.Errorf("failed to create event_participants table: %w", err)
+	}
+
+	if _, err :=db.Exec(indexEvents); err != nil{
+		return fmt.Errorf("failed to create events indexes: %w", err)
+	}
+
+	if _, err :=db.Exec(indexParticipants); err != nil{
+		return fmt.Errorf("failed to create participants indexes: %w", err)
+	}
+
+	// 既存のテーブルに新しいカラムを追加（エラーは無視）
+	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS split_event_step INTEGER DEFAULT 0`)
+	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temp_event_id INTEGER`)
+	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_step INTEGER DEFAULT 0`)
+	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_event_id INTEGER`)
+	db.Exec(`ALTER TABLE event_participants ADD COLUMN IF NOT EXISTS reported_at TIMESTAMP`)
+
+	log.Println("Tables created successfully")
+	return nil
+}
+
+// ユーザーをDBから取得
+func getUser(userID string) (*User, error) {
+	user := &User{}
+	err := db.QueryRow(`
+		SELECT user_id, name, circle, step,
+		       COALESCE(split_event_step, 0), COALESCE(temp_event_id, 0)
+		FROM users
+		WHERE user_id = $1
+	`, userID).Scan(&user.UserID, &user.Name, &user.Circle, &user.Step,
+		&user.SplitEventStep, &user.TempEventID)
+
+	if err == sql.ErrNoRows {
+		return nil, nil // ユーザーが存在しない nil, nilってどうゆう構造なんや
+	}
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// ユーザーをDBに保存
+func saveUser(user *User) error {
+	_, err := db.Exec(`
+		INSERT INTO users (user_id, name, circle, step, split_event_step, temp_event_id, approval_step, approval_event_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, user.UserID, user.Name, user.Circle, user.Step, user.SplitEventStep, user.TempEventID, user.ApprovalStep, user.ApprovalEventID)
+	return err
+}
+
+// ユーザー情報をDBで更新
+func updateUser(user *User) error {
+	_, err := db.Exec(`
+		UPDATE users
+		SET name = $2, circle = $3, step = $4, split_event_step = $5, temp_event_id = $6, approval_step = $7, approval_event_id = $8, updated_at = CURRENT_TIMESTAMP
+		WHERE user_id = $1
+	`, user.UserID, user.Name, user.Circle, user.Step, user.SplitEventStep, user.TempEventID, user.ApprovalStep, user.ApprovalEventID)
+	return err
+}
+
+// メッセージをDBに保存
+func saveMessage(userID, text string) error {
+	_, err := db.Exec(`
+		INSERT INTO messages (user_id, text)
+		VALUES ($1, $2)
+	`, userID, text)
+	return err
+}
+
+// ===== 割り勘関連のデータベース操作関数 =====
+
+// イベントを作成
+func createEvent(organizerID, eventName, circle string, totalAmount, splitAmount int) (int, error) {
+	var eventID int
+	err := db.QueryRow(`
+		INSERT INTO events (event_name, organizer_id, circle, total_amount, split_amount, status)
+		VALUES ($1, $2, $3, $4, $5, 'selecting')
+		RETURNING id
+	`, eventName, organizerID, circle, totalAmount, splitAmount).Scan(&eventID)
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to create event: %w", err)
+	}
+	return eventID, nil
+}
+
+// イベント情報を取得
+func getEvent(eventID int) (*Event, error) {
+	event := &Event{}
+	err := db.QueryRow(`
+		SELECT id, event_name, organizer_id, circle, total_amount, split_amount, status, created_at, updated_at
+		FROM events
+		WHERE id = $1
+	`, eventID).Scan(&event.ID, &event.EventName, &event.OrganizerID, &event.Circle,
+		&event.TotalAmount, &event.SplitAmount, &event.Status, &event.CreatedAt, &event.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get event: %w", err)
+	}
+	return event, nil
+}
+
+// サークル内のユーザー一覧を取得
+func getUsersByCircle(circle string) ([]User, error) {
+	rows, err := db.Query(`
+		SELECT user_id, name, circle, step, COALESCE(split_event_step, 0), COALESCE(temp_event_id, 0)
+		FROM users
+		WHERE circle = $1 AND step = 3
+		ORDER BY name
+	`, circle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get users by circle: %w", err)
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.UserID, &user.Name, &user.Circle, &user.Step,
+			&user.SplitEventStep, &user.TempEventID); err != nil {
+			log.Printf("スキャンエラー: %v", err)
+			continue
+		}
+		users = append(users, user)
+	}
+	return users, nil
+}
+
+// 参加者を追加
+func addParticipant(eventID int, userID, userName string) error {
+	_, err := db.Exec(`
+		INSERT INTO event_participants (event_id, user_id, user_name)
+		VALUES ($1, $2, $3)
+	`, eventID, userID, userName)
+
+	if err != nil {
+		return fmt.Errorf("failed to add participant: %w", err)
+	}
+	return nil
+}
+
+// イベントの参加者一覧を取得
+func getParticipants(eventID int) ([]Participant, error) {
+	rows, err := db.Query(`
+		SELECT id, event_id, user_id, user_name, paid, reported_at, paid_at, created_at
+		FROM event_participants
+		WHERE event_id = $1
+		ORDER BY created_at
+	`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get participants: %w", err)
+	}
+	defer rows.Close()
+
+	var participants []Participant
+	for rows.Next() {
+		var p Participant
+		if err := rows.Scan(&p.ID, &p.EventID, &p.UserID, &p.UserName, &p.Paid, &p.ReportedAt, &p.PaidAt, &p.CreatedAt); err != nil {
+			log.Printf("スキャンエラー: %v", err)
+			continue
+		}
+		participants = append(participants, p)
+	}
+	return participants, nil
+}
+
+// 支払い報告を記録（会計担当者の承認待ち）
+func markAsReported(eventID int, userID string) error {
+	result, err := db.Exec(`
+		UPDATE event_participants
+		SET reported_at = CURRENT_TIMESTAMP
+		WHERE event_id = $1 AND user_id = $2
+	`, eventID, userID)
+
+	if err != nil {
+		return fmt.Errorf("failed to mark as reported: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("participant not found")
+	}
+
+	return nil
+}
+
+// 支払いを承認（会計担当者が確認後）
+func approvePayment(eventID int, userID string) error {
+	result, err := db.Exec(`
+		UPDATE event_participants
+		SET paid = TRUE, paid_at = CURRENT_TIMESTAMP
+		WHERE event_id = $1 AND user_id = $2 AND reported_at IS NOT NULL
+	`, eventID, userID)
+
+	if err != nil {
+		return fmt.Errorf("failed to approve payment: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("participant not found or not reported yet")
+	}
+
+	return nil
+}
+
+// イベントのステータスを更新
+func updateEventStatus(eventID int, status string) error {
+	_, err := db.Exec(`
+		UPDATE events
+		SET status = $2, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1
+	`, eventID, status)
+
+	if err != nil {
+		return fmt.Errorf("failed to update event status: %w", err)
+	}
+	return nil
+}
+
+// ユーザーが参加している未完了のイベントを取得（未払いまたは報告済み）
+func getUserActiveEvent(userID string) (*Event, error) {
+	event := &Event{}
+	err := db.QueryRow(`
+		SELECT e.id, e.event_name, e.organizer_id, e.circle, e.total_amount, e.split_amount, e.status, e.created_at, e.updated_at
+		FROM events e
+		JOIN event_participants p ON e.id = p.event_id
+		WHERE p.user_id = $1 AND p.paid = FALSE AND p.reported_at IS NULL
+		ORDER BY e.created_at DESC
+		LIMIT 1
+	`, userID).Scan(&event.ID, &event.EventName, &event.OrganizerID, &event.Circle,
+		&event.TotalAmount, &event.SplitAmount, &event.Status, &event.CreatedAt, &event.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user active event: %w", err)
+	}
+	return event, nil
+}
+
+// LINE Reply API呼び出し
+func ReplyMessage(replyToken, text string) error {
+	url := "https://api.line.me/v2/bot/message/reply"
+
+	payload := ReplyRequest{
+		ReplyToken: replyToken,
+		Messages: []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{
+			{Type: "text", Text: text},
+		},
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("LINE_CHANNEL_ACCESS_TOKEN"))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("LINE API error: %s", string(body))
+	}
+	return nil
+}
+
+// LINE Push API呼び出し
+func PushMessage(userID, text string) error {
+	url := "https://api.line.me/v2/bot/message/push"
+
+	payload := PushRequest{
+		To: userID,
+		Messages: []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{
+			{Type: "text", Text: text},
+		},
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("LINE_CHANNEL_ACCESS_TOKEN"))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("LINE API error: %s", string(body))
+	}
+	return nil
+}
+
+// ===== LIFF認証関連の関数 =====
+
+// LIFFアクセストークンを検証してユーザーIDを取得
+func verifyLIFFToken(accessToken string) (string, string, error) {
+	// 1. LIFFアクセストークンの検証
+	verifyURL := "https://api.line.me/oauth2/v2.1/verify?access_token=" + accessToken
+
+	resp, err := http.Get(verifyURL)
+	if err != nil {
+		return "", "", fmt.Errorf("token verification failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("invalid token: %s", string(body))
+	}
+
+	// 2. プロフィール情報を取得
+	profileURL := "https://api.line.me/v2/profile"
+	req, _ := http.NewRequest("GET", profileURL, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	profileResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("profile fetch failed: %w", err)
+	}
+	defer profileResp.Body.Close()
+
+	if profileResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(profileResp.Body)
+		return "", "", fmt.Errorf("failed to get profile: %s", string(body))
+	}
+
+	var profile struct {
+		UserID      string `json:"userId"`
+		DisplayName string `json:"displayName"`
+	}
+
+	if err := json.NewDecoder(profileResp.Body).Decode(&profile); err != nil {
+		return "", "", fmt.Errorf("failed to decode profile: %w", err)
+	}
+
+	return profile.UserID, profile.DisplayName, nil
+}
+
+// HTTPリクエストからLIFFトークンを検証し、userIDを取得
+func authenticateRequest(r *http.Request) (string, string, error) {
+	// Authorizationヘッダーからトークンを取得
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return "", "", fmt.Errorf("authorization header is missing")
+	}
+
+	// "Bearer "プレフィックスを削除
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	if token == authHeader {
+		return "", "", fmt.Errorf("invalid authorization header format")
+	}
+
+	// LIFFトークンを検証
+	userID, displayName, err := verifyLIFFToken(token)
+	if err != nil {
+		return "", "", err
+	}
+
+	return userID, displayName, nil
+}
+
+// サニタイズをする関数
+func sanitizeInput(input string) string {
+	sanitized := html.EscapeString(input)
+	sanitized = strings.TrimSpace(sanitized)
+
+	return sanitized
+}
+
+// Webhook: LINEからメッセージ受信
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	// リクエストボディを読み取ってログ出力
+	bodyBytes, _ := io.ReadAll(r.Body)
+	log.Printf("Webhook受信: %s", string(bodyBytes))
+
+	// ボディを再度使えるようにする
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	var req WebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Webhookデコードエラー: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("イベント数: %d", len(req.Events))
+
+	for _, event := range req.Events {
+		log.Printf("イベントタイプ: %s", event.Type)
+
+		if event.Type == "message" && event.Message.Type == "text" {
+			// メッセージを保存
+			messages = append(messages, ReceivedMessage{
+				Timestamp: time.Now(),
+				UserID:    event.Source.UserID,
+				Text:      event.Message.Text,
+			})
+			log.Printf("受信: %s (UserID: %s)", event.Message.Text, event.Source.UserID)
+
+			// handleMessage関数を利用
+			replyText := handleMessage(event.Source.UserID, event.Message.Text)
+			if err := ReplyMessage(event.ReplyToken, replyText); err != nil {
+				log.Printf("返信エラー: %v", err)
+			} else {
+				log.Printf("返信成功: %s", replyText)
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// Web → LINE送信
+func handleSend(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID  string `json:"userId"`
+		Message string `json:"message"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("JSONデコードエラー: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.UserID == "" {
+		log.Printf("エラー: User IDが空です")
+		http.Error(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Message == "" {
+		log.Printf("エラー: メッセージが空です")
+		http.Error(w, "Message is required", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("送信試行: UserID=%s, Message=%s", req.UserID, req.Message)
+
+	if err := PushMessage(req.UserID, req.Message); err != nil {
+		log.Printf("送信エラー: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("送信成功: %s → %s", req.Message, req.UserID)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// 受信メッセージ一覧取得
+func handleAllMessages(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(messages)
+}
+
+// ユーザー一覧取得
+func handleGetUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT user_id, name, circle, step
+		FROM users
+		ORDER BY updated_at DESC
+	`)
+	if err != nil {
+		log.Printf("ユーザー取得エラー: %v", err)
+		http.Error(w, "Failed to get users", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var userList []User
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.UserID, &user.Name, &user.Circle, &user.Step); err != nil {
+			log.Printf("スキャンエラー: %v", err)
+			continue
+		}
+		userList = append(userList, user)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(userList)
+}
+
+// ===== LIFF用APIハンドラー =====
+
+// ユーザー情報登録（LIFF認証付き）
+func handleRegisterUser(w http.ResponseWriter, r *http.Request) {
+	// LIFFトークンを検証してuserIDを取得
+	userID, displayName, err := authenticateRequest(r)
+	if err != nil {
+		log.Printf("認証エラー: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// リクエストボディを読み取り
+	var req struct {
+		Circle string `json:"circle"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("JSONデコードエラー: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	circle := sanitizeInput(req.Circle)
+	if circle == "" {
+		http.Error(w, "Circle is required", http.StatusBadRequest)
+		return
+	}
+
+	// 既存ユーザーをチェック
+	existingUser, err := getUser(userID)
+	if err != nil {
+		log.Printf("ユーザー取得エラー: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if existingUser != nil {
+		// 既存ユーザーの場合は更新
+		existingUser.Name = displayName
+		existingUser.Circle = circle
+		existingUser.Step = 3 // 登録完了
+		if err := updateUser(existingUser); err != nil {
+			log.Printf("ユーザー更新エラー: %v", err)
+			http.Error(w, "Failed to update user", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("ユーザー更新成功: %s (%s)", displayName, userID)
+	} else {
+		// 新規ユーザーの場合は作成
+		newUser := &User{
+			UserID: userID,
+			Name:   displayName,
+			Circle: circle,
+			Step:   3, // 登録完了
+		}
+		if err := saveUser(newUser); err != nil {
+			log.Printf("ユーザー保存エラー: %v", err)
+			http.Error(w, "Failed to save user", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("新規ユーザー登録成功: %s (%s)", displayName, userID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "ok",
+		"userId":      userID,
+		"displayName": displayName,
+		"circle":      circle,
+	})
+}
+
+// メッセージ送信（LIFF認証付き）
+func handleLIFFMessage(w http.ResponseWriter, r *http.Request) {
+	// LIFFトークンを検証してuserIDを取得
+	userID, _, err := authenticateRequest(r)
+	if err != nil {
+		log.Printf("認証エラー: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// リクエストボディを読み取り
+	var req struct {
+		Message string `json:"message"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("JSONデコードエラー: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	message := sanitizeInput(req.Message)
+	if message == "" {
+		http.Error(w, "Message is required", http.StatusBadRequest)
+		return
+	}
+
+	// メッセージを処理
+	replyText := handleMessage(userID, message)
+
+	// メッセージをDBに保存
+	if err := saveMessage(userID, message); err != nil {
+		log.Printf("メッセージ保存エラー: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"reply":  replyText,
+	})
+}
+
+// ユーザー情報取得（LIFF認証付き）
+func handleGetMyInfo(w http.ResponseWriter, r *http.Request) {
+	// LIFFトークンを検証してuserIDを取得
+	userID, displayName, err := authenticateRequest(r)
+	if err != nil {
+		log.Printf("認証エラー: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// DBからユーザー情報を取得
+	user, err := getUser(userID)
+	if err != nil {
+		log.Printf("ユーザー取得エラー: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if user == nil {
+		// 未登録ユーザー
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"userId":      userID,
+			"displayName": displayName,
+			"registered":  false,
+		})
+		return
+	}
+
+	// 登録済みユーザー
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"userId":      user.UserID,
+		"name":        user.Name,
+		"displayName": displayName,
+		"circle":      user.Circle,
+		"registered":  true,
+		"step":        user.Step,
+	})
+}
+
+// ===== 割り勘フロー処理関数 =====
+
+// 登録済みユーザーのメッセージ処理
+func handleRegisteredUserMessage(user *User, message string) string {
+	// 割り勘フロー中の場合
+	if user.SplitEventStep > 0 {
+		return handleSplitEventFlow(user, message)
+	}
+
+	// 承認フロー中の場合
+	if user.ApprovalStep > 0 {
+		return handleApprovalFlow(user, message)
+	}
+
+	// コマンド処理
+	switch message {
+	case "割り勘":
+		return startSplitEvent(user)
+	case "支払いました":
+		return handlePaymentReport(user)
+	case "状況確認":
+		return handleStatusCheck(user)
+	case "承認":
+		return startApproval(user)
+	default:
+		return "コマンド一覧:\n・割り勘\n・支払いました\n・状況確認\n・承認"
+	}
+}
+
+// 割り勘イベント作成開始
+func startSplitEvent(user *User) string {
+	user.SplitEventStep = 1
+	if err := updateUser(user); err != nil {
+		log.Printf("ユーザー更新エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+	return "割り勘イベントを作成します！\nイベント名を教えてください（例: 新歓飲み会）"
+}
+
+// 割り勘フロー処理
+func handleSplitEventFlow(user *User, message string) string {
+	switch user.SplitEventStep {
+	case 1:
+		// イベント名入力
+		return handleEventNameInput(user, message)
+	case 2:
+		// 金額入力
+		return handleAmountInput(user, message)
+	case 3:
+		// 参加者選択
+		return handleParticipantSelection(user, message)
+	default:
+		user.SplitEventStep = 0
+		updateUser(user)
+		return "エラーが発生しました。最初からやり直してください。"
+	}
+}
+
+// イベント名入力処理
+func handleEventNameInput(user *User, eventName string) string {
+	// 仮イベントを作成（金額は後で更新）
+	eventID, err := createEvent(user.UserID, eventName, user.Circle, 0, 0)
+	if err != nil {
+		log.Printf("イベント作成エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	user.TempEventID = eventID
+	user.SplitEventStep = 2
+	if err := updateUser(user); err != nil {
+		log.Printf("ユーザー更新エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	return "合計金額を教えてください（数字のみ、例: 15000）"
+}
+
+// 金額入力処理
+func handleAmountInput(user *User, message string) string {
+	var totalAmount int
+	if _, err := fmt.Sscanf(message, "%d", &totalAmount); err != nil || totalAmount <= 0 {
+		return "正しい金額を入力してください（数字のみ）"
+	}
+
+	// イベント情報を取得して更新
+	event, err := getEvent(user.TempEventID)
+	if err != nil || event == nil {
+		log.Printf("イベント取得エラー: %v", err)
+		return "エラーが発生しました。最初からやり直してください。"
+	}
+
+	// 一旦splitAmountは0で保存（参加者数が確定していないため）
+	_, err = db.Exec(`
+		UPDATE events
+		SET total_amount = $2
+		WHERE id = $1
+	`, user.TempEventID, totalAmount)
+
+	if err != nil {
+		log.Printf("イベント更新エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	user.SplitEventStep = 3
+	if err := updateUser(user); err != nil {
+		log.Printf("ユーザー更新エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	// サークルのメンバー一覧を取得
+	members, err := getUsersByCircle(user.Circle)
+	if err != nil {
+		log.Printf("メンバー取得エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	if len(members) == 0 {
+		return "サークルメンバーが見つかりません。"
+	}
+
+	// メンバー一覧を表示（自分以外）
+	var memberList strings.Builder
+	memberList.WriteString(fmt.Sprintf("了解しました！\nイベント名: %s\n合計金額: %s円\n\n", event.EventName, formatAmount(totalAmount)))
+	memberList.WriteString(fmt.Sprintf("次に参加者を選択してください。\n同じサークル（%s）のメンバー:\n", user.Circle))
+
+	memberIndex := 1
+	for _, member := range members {
+		if member.UserID != user.UserID {
+			memberList.WriteString(fmt.Sprintf("%d. %s\n", memberIndex, member.Name))
+			memberIndex++
+		}
+	}
+
+	memberList.WriteString("\n番号をスペース区切りで送ってください（例: 1 2 3）\n「確定」と送信すると会計のみで確定します")
+
+	return memberList.String()
+}
+
+// 参加者選択処理
+func handleParticipantSelection(user *User, message string) string {
+	event, err := getEvent(user.TempEventID)
+	if err != nil || event == nil {
+		log.Printf("イベント取得エラー: %v", err)
+		return "エラーが発生しました。最初からやり直してください。"
+	}
+
+	// サークルメンバーを取得
+	members, err := getUsersByCircle(user.Circle)
+	if err != nil {
+		log.Printf("メンバー取得エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	// 自分以外のメンバーをリスト化
+	var otherMembers []User
+	for _, member := range members {
+		if member.UserID != user.UserID {
+			otherMembers = append(otherMembers, member)
+		}
+	}
+
+	var selectedMembers []User
+
+	// 「確定」の場合は会計のみ
+	if message != "確定" {
+		// 番号を解析
+		numbers := strings.Fields(message)
+		for _, numStr := range numbers {
+			var num int
+			if _, err := fmt.Sscanf(numStr, "%d", &num); err == nil {
+				if num > 0 && num <= len(otherMembers) {
+					selectedMembers = append(selectedMembers, otherMembers[num-1])
+				}
+			}
+		}
+
+		if len(selectedMembers) == 0 {
+			return "正しい番号を入力してください（例: 1 2 3）\nまたは「確定」と送信してください"
+		}
+	}
+
+	// 会計担当者を参加者に追加
+	if err := addParticipant(user.TempEventID, user.UserID, user.Name); err != nil {
+		log.Printf("参加者追加エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	// 選択されたメンバーを参加者に追加
+	for _, member := range selectedMembers {
+		if err := addParticipant(user.TempEventID, member.UserID, member.Name); err != nil {
+			log.Printf("参加者追加エラー: %v", err)
+		}
+	}
+
+	// 参加者数に基づいて1人あたりの金額を計算
+	totalParticipants := len(selectedMembers) + 1 // +1は会計担当者
+	splitAmount := event.TotalAmount / totalParticipants
+
+	// イベント情報を更新
+	_, err = db.Exec(`
+		UPDATE events
+		SET split_amount = $2, status = 'confirmed'
+		WHERE id = $1
+	`, user.TempEventID, splitAmount)
+
+	if err != nil {
+		log.Printf("イベント更新エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	// ユーザーのステップをリセット
+	user.SplitEventStep = 0
+	user.TempEventID = 0
+	if err := updateUser(user); err != nil {
+		log.Printf("ユーザー更新エラー: %v", err)
+	}
+
+	// 参加者全員に通知
+	go notifyParticipants(event.ID, user.Name)
+
+	// 確認メッセージ
+	var response strings.Builder
+	response.WriteString("以下のメンバーを選択しました:\n")
+	for _, member := range selectedMembers {
+		response.WriteString(fmt.Sprintf("・%s\n", member.Name))
+	}
+	response.WriteString(fmt.Sprintf("・%s（会計）\n\n", user.Name))
+	response.WriteString(fmt.Sprintf("合計%d人で%s円 → 1人あたり %s円\n\n", totalParticipants, formatAmount(event.TotalAmount), formatAmount(splitAmount)))
+	response.WriteString("割り勘イベントを作成しました！\n参加者全員に通知を送信しました。\n\n")
+	response.WriteString("「状況確認」で支払い状況を確認できます。")
+
+	return response.String()
+}
+
+// 支払い報告処理
+func handlePaymentReport(user *User) string {
+	// ユーザーの未払いイベントを取得
+	event, err := getUserActiveEvent(user.UserID)
+	if err != nil {
+		log.Printf("イベント取得エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	if event == nil {
+		return "未払いのイベントはありません。"
+	}
+
+	// 支払い報告を記録（承認待ち状態）
+	if err := markAsReported(event.ID, user.UserID); err != nil {
+		log.Printf("支払い報告エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	// 会計担当者に通知
+	go func() {
+		organizerName := ""
+		organizer, err := getUser(event.OrganizerID)
+		if err == nil && organizer != nil {
+			organizerName = organizer.Name
+		}
+
+		notifyText := fmt.Sprintf("%sさんが支払い報告をしました。\n（%s: %s円）\n\n「承認」コマンドで支払いを承認してください。\n「状況確認」で詳細を確認できます。", user.Name, event.EventName, formatAmount(event.SplitAmount))
+		PushMessage(event.OrganizerID, notifyText)
+		log.Printf("会計担当者（%s）に通知: %s", organizerName, notifyText)
+	}()
+
+	return fmt.Sprintf("支払い報告を受け付けました。\n（%s: %s円）\n\n会計担当者の確認をお待ちください。", event.EventName, formatAmount(event.SplitAmount))
+}
+
+// 支払い状況確認
+func handleStatusCheck(user *User) string {
+	// ユーザーが会計のイベントを取得
+	rows, err := db.Query(`
+		SELECT id, event_name, total_amount, split_amount, status
+		FROM events
+		WHERE organizer_id = $1
+		ORDER BY created_at DESC
+		LIMIT 5
+	`, user.UserID)
+
+	if err != nil {
+		log.Printf("イベント取得エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+	defer rows.Close()
+
+	var response strings.Builder
+	response.WriteString("【支払い状況】\n\n")
+
+	hasEvents := false
+	for rows.Next() {
+		hasEvents = true
+		var eventID int
+		var eventName string
+		var totalAmount, splitAmount int
+		var status string
+
+		if err := rows.Scan(&eventID, &eventName, &totalAmount, &splitAmount, &status); err != nil {
+			continue
+		}
+
+		response.WriteString(fmt.Sprintf("▼ %s\n", eventName))
+		response.WriteString(fmt.Sprintf("合計: %s円 (1人: %s円)\n", formatAmount(totalAmount), formatAmount(splitAmount)))
+
+		// 参加者の支払い状況を取得
+		participants, err := getParticipants(eventID)
+		if err != nil {
+			continue
+		}
+
+		// 状態ごとに分類
+		var paidList, reportedList, unpaidList []Participant
+		for _, p := range participants {
+			if p.Paid {
+				paidList = append(paidList, p)
+			} else if p.ReportedAt != nil {
+				reportedList = append(reportedList, p)
+			} else {
+				unpaidList = append(unpaidList, p)
+			}
+		}
+
+		// 支払い済み
+		if len(paidList) > 0 {
+			response.WriteString(fmt.Sprintf("\n✅ 支払い済み（%d人）\n", len(paidList)))
+			for _, p := range paidList {
+				response.WriteString(fmt.Sprintf("   %s: %s円\n", p.UserName, formatAmount(splitAmount)))
+			}
+		}
+
+		// 報告済み（未承認）
+		if len(reportedList) > 0 {
+			response.WriteString(fmt.Sprintf("\n📋 報告済み（未承認: %d人）\n", len(reportedList)))
+			for _, p := range reportedList {
+				response.WriteString(fmt.Sprintf("   %s: %s円\n", p.UserName, formatAmount(splitAmount)))
+			}
+		}
+
+		// 未払い
+		if len(unpaidList) > 0 {
+			response.WriteString(fmt.Sprintf("\n❌ 未払い（%d人）\n", len(unpaidList)))
+			for _, p := range unpaidList {
+				response.WriteString(fmt.Sprintf("   %s: %s円\n", p.UserName, formatAmount(splitAmount)))
+			}
+		}
+
+		response.WriteString("\n")
+	}
+
+	if !hasEvents {
+		response.WriteString("イベントがありません。\n「割り勘」と送信して新しいイベントを作成できます。")
+	} else {
+		response.WriteString("「承認」で報告済みの支払いを承認できます。")
+	}
+
+	return response.String()
+}
+
+// 参加者全員に通知
+func notifyParticipants(eventID int, organizerName string) {
+	event, err := getEvent(eventID)
+	if err != nil || event == nil {
+		log.Printf("通知エラー: イベント取得失敗")
+		return
+	}
+
+	participants, err := getParticipants(eventID)
+	if err != nil {
+		log.Printf("通知エラー: 参加者取得失敗")
+		return
+	}
+
+	for _, p := range participants {
+		// 会計担当者には通知しない
+		if p.UserID == event.OrganizerID {
+			continue
+		}
+
+		notifyText := fmt.Sprintf("【割り勘のお知らせ】\n%sさんが割り勘イベントを作成しました。\n\nイベント: %s\nあなたの支払額: %s円\n支払先: %s\n\n支払いが完了したら「支払いました」と送信してください。",
+			organizerName, event.EventName, formatAmount(event.SplitAmount), organizerName)
+
+		if err := PushMessage(p.UserID, notifyText); err != nil {
+			log.Printf("通知エラー (%s): %v", p.UserName, err)
+		} else {
+			log.Printf("通知成功: %s", p.UserName)
+		}
+	}
+}
+
+// 金額フォーマット（カンマ区切り）
+func formatAmount(amount int) string {
+	str := fmt.Sprintf("%d", amount)
+	if len(str) <= 3 {
+		return str
+	}
+
+	var result strings.Builder
+	for i, c := range str {
+		if i > 0 && (len(str)-i)%3 == 0 {
+			result.WriteRune(',')
+		}
+		result.WriteRune(c)
+	}
+	return result.String()
+}
+
+// ===== 承認フロー処理関数 =====
+
+// 承認フロー開始
+func startApproval(user *User) string {
+	// 報告済み（未承認）の参加者がいるイベントを取得
+	rows, err := db.Query(`
+		SELECT DISTINCT e.id, e.event_name
+		FROM events e
+		JOIN event_participants p ON e.id = p.event_id
+		WHERE e.organizer_id = $1 AND e.status = 'confirmed'
+		  AND p.reported_at IS NOT NULL AND p.paid = FALSE
+		ORDER BY e.created_at DESC
+	`, user.UserID)
+
+	if err != nil {
+		log.Printf("イベント取得エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+	defer rows.Close()
+
+	var events []struct {
+		ID   int
+		Name string
+	}
+
+	for rows.Next() {
+		var e struct {
+			ID   int
+			Name string
+		}
+		if err := rows.Scan(&e.ID, &e.Name); err != nil {
+			continue
+		}
+		events = append(events, e)
+	}
+
+	if len(events) == 0 {
+		return "承認待ちの支払い報告はありません。"
+	}
+
+	// 1つのイベントの場合は直接承認フローへ
+	if len(events) == 1 {
+		return showApprovalList(user, events[0].ID)
+	}
+
+	// 複数のイベントがある場合はイベント選択
+	var response strings.Builder
+	response.WriteString("承認対象のイベントを選択してください:\n\n")
+	for i, e := range events {
+		response.WriteString(fmt.Sprintf("%d. %s\n", i+1, e.Name))
+	}
+	response.WriteString("\n番号を送信してください")
+
+	// 一旦、最初のイベントで承認フローを開始（簡略化）
+	return showApprovalList(user, events[0].ID)
+}
+
+// 承認リストを表示
+func showApprovalList(user *User, eventID int) string {
+	event, err := getEvent(eventID)
+	if err != nil || event == nil {
+		return "イベントが見つかりません。"
+	}
+
+	participants, err := getParticipants(eventID)
+	if err != nil {
+		return "参加者情報の取得に失敗しました。"
+	}
+
+	// 報告済み（未承認）の参加者をリスト化
+	var reportedList []Participant
+	for _, p := range participants {
+		if !p.Paid && p.ReportedAt != nil {
+			reportedList = append(reportedList, p)
+		}
+	}
+
+	if len(reportedList) == 0 {
+		return "承認待ちの支払い報告はありません。"
+	}
+
+	var response strings.Builder
+	response.WriteString(fmt.Sprintf("【%s】\n", event.EventName))
+	response.WriteString("報告済みの支払いを承認します。\n\n")
+
+	for i, p := range reportedList {
+		response.WriteString(fmt.Sprintf("%d. %s (%s円)\n", i+1, p.UserName, formatAmount(event.SplitAmount)))
+	}
+
+	response.WriteString("\n承認する番号を送ってください（例: 1 2）\n")
+	response.WriteString("「すべて」で全員承認\n")
+	response.WriteString("「キャンセル」で中止")
+
+	// 承認フローを開始
+	user.ApprovalStep = 1
+	user.ApprovalEventID = eventID
+	if err := updateUser(user); err != nil {
+		log.Printf("ユーザー更新エラー: %v", err)
+		return "エラーが発生しました。"
+	}
+
+	return response.String()
+}
+
+// 承認フロー処理
+func handleApprovalFlow(user *User, message string) string {
+	// キャンセル
+	if message == "キャンセル" {
+		user.ApprovalStep = 0
+		user.ApprovalEventID = 0
+		if err := updateUser(user); err != nil {
+			log.Printf("ユーザー更新エラー: %v", err)
+		}
+		return "承認をキャンセルしました。"
+	}
+
+	event, err := getEvent(user.ApprovalEventID)
+	if err != nil || event == nil {
+		user.ApprovalStep = 0
+		user.ApprovalEventID = 0
+		updateUser(user)
+		return "イベントが見つかりません。"
+	}
+
+	// 🔒 承認権限チェック：承認者が会計担当者かどうか確認
+	if event.OrganizerID != user.UserID {
+		user.ApprovalStep = 0
+		user.ApprovalEventID = 0
+		updateUser(user)
+		return "エラー：この操作は会計担当者のみ実行できます。"
+	}
+
+	participants, err := getParticipants(user.ApprovalEventID)
+	if err != nil {
+		return "参加者情報の取得に失敗しました。"
+	}
+
+	// 報告済み（未承認）の参加者をリスト化
+	var reportedList []Participant
+	for _, p := range participants {
+		if !p.Paid && p.ReportedAt != nil {
+			reportedList = append(reportedList, p)
+		}
+	}
+
+	if len(reportedList) == 0 {
+		user.ApprovalStep = 0
+		user.ApprovalEventID = 0
+		updateUser(user)
+		return "承認待ちの支払い報告はありません。"
+	}
+
+	var approvedList []Participant
+
+	// 「すべて」の場合は全員承認
+	if message == "すべて" {
+		approvedList = reportedList
+	} else {
+		// 番号を解析
+		numbers := strings.Fields(message)
+		for _, numStr := range numbers {
+			var num int
+			if _, err := fmt.Sscanf(numStr, "%d", &num); err == nil {
+				if num > 0 && num <= len(reportedList) {
+					approvedList = append(approvedList, reportedList[num-1])
+				}
+			}
+		}
+
+		if len(approvedList) == 0 {
+			return "正しい番号を入力してください（例: 1 2）\nまたは「すべて」「キャンセル」と送信してください"
+		}
+	}
+
+	// 承認処理
+	var approvedNames []string
+	for _, p := range approvedList {
+		if err := approvePayment(user.ApprovalEventID, p.UserID); err != nil {
+			log.Printf("承認エラー (%s): %v", p.UserName, err)
+		} else {
+			approvedNames = append(approvedNames, p.UserName)
+
+			// 参加者に通知
+			go func(userID, userName string) {
+				notifyText := fmt.Sprintf("【支払い承認】\n%sさんが支払いを承認しました。\n\nイベント: %s\n金額: %s円\n\nありがとうございました！",
+					user.Name, event.EventName, formatAmount(event.SplitAmount))
+				PushMessage(userID, notifyText)
+				log.Printf("承認通知送信: %s", userName)
+			}(p.UserID, p.UserName)
+		}
+	}
+
+	// 承認フローをリセット
+	user.ApprovalStep = 0
+	user.ApprovalEventID = 0
+	if err := updateUser(user); err != nil {
+		log.Printf("ユーザー更新エラー: %v", err)
+	}
+
+	if len(approvedNames) == 0 {
+		return "承認に失敗しました。"
+	}
+
+	var response strings.Builder
+	response.WriteString(fmt.Sprintf("%d人の支払いを承認しました。\n\n", len(approvedNames)))
+	for _, name := range approvedNames {
+		response.WriteString(fmt.Sprintf("✅ %s\n", name))
+	}
+	response.WriteString("\n参加者に通知を送信しました。")
+
+	return response.String()
+}
+
+func handleMessage(userID string, message string) string {
+	message = sanitizeInput(message)
+
+	if message == "" {
+		return "中身がないです"
+	}
+
+	// メッセージをDBに保存
+	if err := saveMessage(userID, message); err != nil {
+		log.Printf("メッセージ保存エラー: %v", err)
+	}
+
+	// DBからユーザー取得
+	user, err := getUser(userID)
+	if err != nil {
+		log.Printf("ユーザー取得エラー: %v", err)
+		return "エラーが発生しました。しばらくしてからもう一度お試しください。"
+	}
+
+	// 新規ユーザーの場合
+	if user == nil {
+		newUser := &User{
+			UserID: userID,
+			Name:   "",
+			Circle: "",
+			Step:   1,
+		}
+		if err := saveUser(newUser); err != nil {
+			log.Printf("ユーザー保存エラー: %v", err)
+			return "エラーが発生しました。しばらくしてからもう一度お試しください。"
+		}
+		return "初めまして！お名前を教えてください！"
+	}
+
+	// 登録段階に応じて対応を変える
+	switch user.Step {
+	case 1:
+		user.Name = message
+		user.Step = 2
+		if err := updateUser(user); err != nil {
+			log.Printf("ユーザー更新エラー: %v", err)
+			return "エラーが発生しました。しばらくしてからもう一度お試しください。"
+		}
+		return fmt.Sprintf("%sさんありがとうございます！\n所属しているサークル名を教えてください！", user.Name)
+	case 2:
+		user.Circle = message
+		user.Step = 3
+		if err := updateUser(user); err != nil {
+			log.Printf("ユーザー更新エラー: %v", err)
+			return "エラーが発生しました。しばらくしてからもう一度お試しください。"
+		}
+		return fmt.Sprintf("登録完了しました！\n名前: %s\nサークル: %s\n\nこれから CirclePay をご利用いただけます！", user.Name, user.Circle)
+	case 3:
+		// 登録完了後のメッセージ処理
+		return handleRegisteredUserMessage(user, message)
+	default:
+		return ""
+	}
+}
+
+// 静的ファイルハンドラー（SPA対応）
+func handleStaticFiles(w http.ResponseWriter, r *http.Request) {
+	// 静的ファイルのディレクトリ
+	staticDir := "frontend/dist"
+
+	// リクエストされたパス
+	path := r.URL.Path
+	if path == "/" {
+		path = "/index.html"
+	}
+
+	// ファイルパスを構築
+	filePath := staticDir + path
+
+	// ファイルが存在するか確認
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		// ファイルが存在しない場合はindex.htmlを返す（SPA対応）
+		http.ServeFile(w, r, staticDir+"/index.html")
+		return
+	}
+
+	// ファイルを返す
+	http.ServeFile(w, r, filePath)
+}
+
+func main() {
+	// .envファイルを読み込み
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: .env file not found, using system environment variables")
+	}
+
+	if os.Getenv("LINE_CHANNEL_ACCESS_TOKEN") == "" {
+		log.Fatal("LINE_CHANNEL_ACCESS_TOKEN is not set")
+	}
+
+	// データベース初期化
+	if err := initDB(); err != nil {
+		log.Fatal("Failed to initialize database: ", err)
+	}
+	defer db.Close()
+
+	// テーブル作成
+	if err := createTables(); err != nil {
+		log.Fatal("Failed to create tables: ", err)
+	}
+
+	// 既存のエンドポイント（Webhook、管理画面用）
+	http.HandleFunc("/webhook", handleWebhook)
+	http.HandleFunc("/send", handleSend)
+	http.HandleFunc("/messages", handleAllMessages)
+	http.HandleFunc("/api/users", handleGetUsers)
+
+	// LIFF用APIエンドポイント（認証付き）
+	http.HandleFunc("/api/liff/register", handleRegisterUser)
+	http.HandleFunc("/api/liff/message", handleLIFFMessage)
+	http.HandleFunc("/api/liff/me", handleGetMyInfo)
+
+	// 静的ファイル
+	http.HandleFunc("/", handleStaticFiles)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Server starting on port %s...", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}

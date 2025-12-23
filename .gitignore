@@ -1,0 +1,14 @@
+.env
+
+# 会話履歴ファイル（個人情報を含む）
+conversations.json
+
+# Goビルドファイル
+circle-pay
+
+# IDEファイル
+.vscode/
+.idea/
+
+# OSファイル
+.DS_Store
