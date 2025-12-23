@@ -36,39 +36,53 @@ export const useLiff = () => {
         debugLines.push(`LIFF ID: ${liffId}`);
         debugLines.push(`URL: ${window.location.href}`);
 
-        // LIFF初期化 - 自動ログインを無効化
+        // LIFF初期化
         await liff.init({
           liffId,
-          withLoginOnExternalBrowser: false // 外部ブラウザでの自動ログインを無効化
+          withLoginOnExternalBrowser: false
         });
 
         debugLines.push('LIFF init完了');
 
-        const isInClient = liff.isInClient();
-        const isLoggedIn = liff.isLoggedIn();
-        const os = liff.getOS();
+        // liffオブジェクトが正しく初期化されているか確認
+        if (!liff) {
+          throw new Error('LIFF object is null');
+        }
+
+        const isInClient = liff.isInClient?.() ?? false;
+        const isLoggedIn = liff.isLoggedIn?.() ?? false;
+        const os = liff.getOS?.() ?? 'unknown';
 
         debugLines.push(`isInClient: ${isInClient}`);
         debugLines.push(`isLoggedIn: ${isLoggedIn}`);
         debugLines.push(`OS: ${os}`);
 
         if (isLoggedIn) {
-          const profile = await liff.getProfile();
-          const accessToken = liff.getAccessToken();
+          debugLines.push('プロフィール取得中...');
 
-          debugLines.push(`ユーザー: ${profile.displayName}`);
+          // getProfileがnullを返す可能性があるのでチェック
+          const profile = await liff.getProfile?.();
+
+          if (!profile) {
+            throw new Error('プロフィールを取得できませんでした');
+          }
+
+          const accessToken = liff.getAccessToken?.() || null;
+
+          debugLines.push(`ユーザー: ${profile.displayName || 'unknown'}`);
+          debugLines.push(`トークン: ${accessToken ? 'あり' : 'なし'}`);
 
           setState({
             isLoggedIn: true,
             isLoading: false,
             error: null,
-            userId: profile.userId,
-            displayName: profile.displayName,
-            accessToken: accessToken || null,
+            userId: profile.userId || null,
+            displayName: profile.displayName || null,
+            accessToken: accessToken,
             debugInfo: debugLines.join('\n'),
           });
         } else {
-          debugLines.push('未ログイン - ログインリダイレクトはしない');
+          debugLines.push('未ログイン');
 
           setState({
             isLoggedIn: false,
@@ -83,6 +97,7 @@ export const useLiff = () => {
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         debugLines.push(`エラー: ${errorMsg}`);
+        console.error('LIFF Error:', error);
 
         setState({
           isLoggedIn: false,
@@ -100,8 +115,12 @@ export const useLiff = () => {
   }, []);
 
   const closeWindow = () => {
-    if (liff.isInClient()) {
-      liff.closeWindow();
+    try {
+      if (liff?.isInClient?.()) {
+        liff.closeWindow();
+      }
+    } catch (e) {
+      console.error('closeWindow error:', e);
     }
   };
 
