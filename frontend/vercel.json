@@ -3,6 +3,10 @@
     {
       "source": "/api/:path*",
       "destination": "https://furrowlike-facetiously-cyndy.ngrok-free.dev/api/:path*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }
