@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +13,6 @@ import (
 	"os"
 	"time"
 )
-
-// ========== LINE Bot用データ構造 ==========
 
 // LINE Webhook用構造体
 type WebhookRequest struct {
@@ -47,187 +48,48 @@ type ActionObject struct {
 	URI   string `json:"uri,omitempty"`
 }
 
-type QuickReply struct {
-	Items []QuickReplyButton `json:"items"`
-}
-
-type ReplyRequestWithQuickReply struct {
-	ReplyToken string                   `json:"replyToken"`
-	Messages   []MessageWithQuickReply `json:"messages"`
-}
-
-type MessageWithQuickReply struct {
-	Type       string      `json:"type"`
-	Text       string      `json:"text"`
-	QuickReply *QuickReply `json:"quickReply,omitempty"`
-}
-
-// LINE Reply API用構造体（シンプル版）
-type ReplyRequest struct {
-	ReplyToken string `json:"replyToken"`
-	Messages   []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"messages"`
-}
-
-// LINE Push API用構造体
-type PushRequest struct {
-	To       string `json:"to"`
-	Messages []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"messages"`
-}
-
-// ========== LINE API呼び出し関数（テンプレートメソッドパターン） ==========
-
-// LINEMessageSender はLINE APIへのメッセージ送信を抽象化するインターフェース
-type LINEMessageSender interface {
-	Endpoint() string
-	BuildPayload() interface{}
-}
-
-// sendLINEMessage はテンプレートメソッド：共通のHTTP送信処理を実行
-func sendLINEMessage(sender LINEMessageSender) error {
-	// Step 1: ペイロードをJSON化
-	jsonData, err := json.Marshal(sender.BuildPayload())
-	if err != nil {
-		return fmt.Errorf("JSON marshal error: %w", err)
-	}
-
-	// Step 2: HTTPリクエストを作成
-	req, err := http.NewRequest("POST", sender.Endpoint(), bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("request creation error: %w", err)
-	}
-
-	// Step 3: 共通ヘッダーを設定
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("LINE_CHANNEL_ACCESS_TOKEN"))
-
-	// Step 4: リクエストを実行
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Step 5: レスポンスを検証
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("LINE API error: %s", string(body))
-	}
-
-	return nil
-}
-
-// ========== 具象メッセージ型 ==========
-
-// ReplyTextMessage はシンプルなテキスト返信
-type ReplyTextMessage struct {
-	ReplyToken string
-	Text       string
-}
-
-func (m ReplyTextMessage) Endpoint() string {
-	return "https://api.line.me/v2/bot/message/reply"
-}
-
-func (m ReplyTextMessage) BuildPayload() interface{} {
-	return ReplyRequest{
-		ReplyToken: m.ReplyToken,
-		Messages: []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}{
-			{Type: "text", Text: m.Text},
-		},
-	}
-}
-
-// ReplyQuickReplyMessage はQuick Reply付き返信
-type ReplyQuickReplyMessage struct {
-	ReplyToken string
-	Text       string
-	Buttons    []QuickReplyButton
-}
-
-func (m ReplyQuickReplyMessage) Endpoint() string {
-	return "https://api.line.me/v2/bot/message/reply"
-}
-
-func (m ReplyQuickReplyMessage) BuildPayload() interface{} {
-	return ReplyRequestWithQuickReply{
-		ReplyToken: m.ReplyToken,
-		Messages: []MessageWithQuickReply{
-			{
-				Type: "text",
-				Text: m.Text,
-				QuickReply: &QuickReply{
-					Items: m.Buttons,
-				},
-			},
-		},
-	}
-}
-
-// PushTextMessage はユーザーへのプッシュメッセージ
-type PushTextMessage struct {
-	UserID string
-	Text   string
-}
-
-func (m PushTextMessage) Endpoint() string {
-	return "https://api.line.me/v2/bot/message/push"
-}
-
-func (m PushTextMessage) BuildPayload() interface{} {
-	return PushRequest{
-		To: m.UserID,
-		Messages: []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}{
-			{Type: "text", Text: m.Text},
-		},
-	}
-}
-
-// ========== 便利関数（既存APIとの互換性を維持） ==========
-
-// ReplyMessage はシンプルなテキストメッセージで返信
-func ReplyMessage(replyToken, text string) error {
-	return sendLINEMessage(ReplyTextMessage{
-		ReplyToken: replyToken,
-		Text:       text,
-	})
-}
-
-// ReplyMessageWithQuickReply はQuick Replyボタン付きメッセージで返信
-func ReplyMessageWithQuickReply(replyToken, text string, buttons []QuickReplyButton) error {
-	return sendLINEMessage(ReplyQuickReplyMessage{
-		ReplyToken: replyToken,
-		Text:       text,
-		Buttons:    buttons,
-	})
-}
-
-// PushMessage はユーザーにメッセージをプッシュ送信
-func PushMessage(userID, text string) error {
-	return sendLINEMessage(PushTextMessage{
-		UserID: userID,
-		Text:   text,
-	})
-}
-
 // ========== Webhookハンドラー ==========
+
+// validateWebhookSignature はLINE Webhookの署名を検証する
+func validateWebhookSignature(body []byte, signature string) bool {
+	channelSecret := os.Getenv("LINE_CHANNEL_SECRET")
+	if channelSecret == "" {
+		log.Printf("警告: LINE_CHANNEL_SECRET が設定されていません")
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(channelSecret))
+	mac.Write(body)
+	expectedSignature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(signature), []byte(expectedSignature))
+}
 
 // Webhook: LINEからメッセージ受信
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
-	// リクエストボディを読み取ってログ出力
-	bodyBytes, _ := io.ReadAll(r.Body)
-	log.Printf("Webhook受信: %s", string(bodyBytes))
+	// リクエストボディを読み取る
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("リクエストボディ読み取りエラー: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// 署名を検証
+	signature := r.Header.Get("X-Line-Signature")
+	if signature == "" {
+		log.Printf("署名がありません")
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if !validateWebhookSignature(bodyBytes, signature) {
+		log.Printf("署名検証失敗")
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	log.Printf("Webhook受信（署名検証済み）")
 
 	// ボディを再度使えるようにする
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
