@@ -538,13 +538,13 @@ func main() {
 	// LINE Bot関連（bot.go）
 	http.HandleFunc("/webhook", handleWebhook)
 
-	// LIFF関連（liff.go）
-	http.HandleFunc("/api/liff/register", handleRegisterUser)
-	http.HandleFunc("/api/liff/message", handleLIFFMessage)
-	http.HandleFunc("/api/liff/me", handleGetMyInfo)
-	http.HandleFunc("/api/liff/events", handleEvents)
-	http.HandleFunc("/api/liff/approvals", handleApprovals)
-	http.HandleFunc("/api/liff/circle/members", handleGetCircleMembers)
+	// LIFF関連（liff.go）- 認証付きハンドラー
+	http.HandleFunc("/api/liff/register", WithAuth(handleRegisterUser))
+	http.HandleFunc("/api/liff/message", WithAuth(handleLIFFMessage))
+	http.HandleFunc("/api/liff/me", WithAuth(handleGetMyInfo))
+	http.HandleFunc("/api/liff/events", WithAuth(handleEvents))
+	http.HandleFunc("/api/liff/approvals", WithAuth(handleApprovals))
+	http.HandleFunc("/api/liff/circle/members", WithAuth(handleGetCircleMembers))
 
 	// 管理用API
 	http.HandleFunc("/api/users", handleGetUsers)

@@ -6,12 +6,11 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
 )
 
-// ========== LIFF認証関数 ==========
+// ========== LIFFトークン検証 ==========
 
-// LIFFアクセストークンを検証してユーザーIDを取得
+// verifyLIFFToken はLIFFアクセストークンを検証してユーザーIDを取得
 func verifyLIFFToken(accessToken string) (string, string, error) {
 	// 1. LIFFアクセストークンの検証
 	verifyURL := "https://api.line.me/oauth2/v2.1/verify?access_token=" + accessToken
@@ -55,220 +54,142 @@ func verifyLIFFToken(accessToken string) (string, string, error) {
 	return profile.UserID, profile.DisplayName, nil
 }
 
-// HTTPリクエストからLIFFトークンを検証し、userIDを取得
-func authenticateRequest(r *http.Request) (string, string, error) {
-	// Authorizationヘッダーからトークンを取得
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return "", "", fmt.Errorf("authorization header is missing")
-	}
-
-	// "Bearer "プレフィックスを削除
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-	if token == authHeader {
-		return "", "", fmt.Errorf("invalid authorization header format")
-	}
-
-	// LIFFトークンを検証
-	userID, displayName, err := verifyLIFFToken(token)
-	if err != nil {
-		return "", "", err
-	}
-
-	return userID, displayName, nil
-}
-
 // ========== LIFF APIハンドラー ==========
 
-// ユーザー情報登録（LIFF認証付き）
-func handleRegisterUser(w http.ResponseWriter, r *http.Request) {
-	// LIFFトークンを検証してuserIDを取得
-	userID, displayName, err := authenticateRequest(r)
-	if err != nil {
-		log.Printf("認証エラー: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// リクエストボディを読み取り
+// handleRegisterUser はユーザー情報を登録
+func handleRegisterUser(ctx *APIContext) {
 	var req struct {
 		Circle string `json:"circle"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("JSONデコードエラー: %v", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	if !ctx.DecodeJSON(&req) {
 		return
 	}
 
 	circle := sanitizeInput(req.Circle)
 	if circle == "" {
-		http.Error(w, "Circle is required", http.StatusBadRequest)
+		ctx.Error("Circle is required", http.StatusBadRequest)
 		return
 	}
 
-	// 既存ユーザーをチェック
-	existingUser, err := getUser(userID)
+	existingUser, err := getUser(ctx.UserID)
 	if err != nil {
 		log.Printf("ユーザー取得エラー: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		ctx.Error("Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	if existingUser != nil {
-		// 既存ユーザーの場合は更新
-		existingUser.Name = displayName
+		existingUser.Name = ctx.DisplayName
 		existingUser.Circle = circle
-		existingUser.Step = 3 // 登録完了
+		existingUser.Step = 3
 		if err := updateUser(existingUser); err != nil {
 			log.Printf("ユーザー更新エラー: %v", err)
-			http.Error(w, "Failed to update user", http.StatusInternalServerError)
+			ctx.Error("Failed to update user", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("ユーザー更新成功: %s (%s)", displayName, userID)
+		log.Printf("ユーザー更新成功: %s (%s)", ctx.DisplayName, ctx.UserID)
 	} else {
-		// 新規ユーザーの場合は作成
 		newUser := &User{
-			UserID: userID,
-			Name:   displayName,
+			UserID: ctx.UserID,
+			Name:   ctx.DisplayName,
 			Circle: circle,
-			Step:   3, // 登録完了
+			Step:   3,
 		}
 		if err := saveUser(newUser); err != nil {
 			log.Printf("ユーザー保存エラー: %v", err)
-			http.Error(w, "Failed to save user", http.StatusInternalServerError)
+			ctx.Error("Failed to save user", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("新規ユーザー登録成功: %s (%s)", displayName, userID)
+		log.Printf("新規ユーザー登録成功: %s (%s)", ctx.DisplayName, ctx.UserID)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":      "ok",
-		"userId":      userID,
-		"displayName": displayName,
+	ctx.Success(map[string]interface{}{
+		"userId":      ctx.UserID,
+		"displayName": ctx.DisplayName,
 		"circle":      circle,
 	})
 }
 
-// メッセージ送信（LIFF認証付き）
-func handleLIFFMessage(w http.ResponseWriter, r *http.Request) {
-	// LIFFトークンを検証してuserIDを取得
-	userID, _, err := authenticateRequest(r)
-	if err != nil {
-		log.Printf("認証エラー: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// リクエストボディを読み取り
+// handleLIFFMessage はLIFFからのメッセージを処理
+func handleLIFFMessage(ctx *APIContext) {
 	var req struct {
 		Message string `json:"message"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("JSONデコードエラー: %v", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	if !ctx.DecodeJSON(&req) {
 		return
 	}
 
 	message := sanitizeInput(req.Message)
 	if message == "" {
-		http.Error(w, "Message is required", http.StatusBadRequest)
+		ctx.Error("Message is required", http.StatusBadRequest)
 		return
 	}
 
-	// メッセージをDBに保存
-	if err := saveMessage(userID, message); err != nil {
+	if err := saveMessage(ctx.UserID, message); err != nil {
 		log.Printf("メッセージ保存エラー: %v", err)
 	}
 
-	// TODO: メッセージ処理ロジック（replyTokenなしの場合）
-	replyText := "メッセージを受け取りました"
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ok",
-		"reply":  replyText,
+	ctx.Success(map[string]interface{}{
+		"reply": "メッセージを受け取りました",
 	})
 }
 
-// ユーザー情報取得（LIFF認証付き）
-func handleGetMyInfo(w http.ResponseWriter, r *http.Request) {
-	// LIFFトークンを検証してuserIDを取得
-	userID, displayName, err := authenticateRequest(r)
-	if err != nil {
-		log.Printf("認証エラー: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// DBからユーザー情報を取得
-	user, err := getUser(userID)
+// handleGetMyInfo はユーザー情報を取得
+func handleGetMyInfo(ctx *APIContext) {
+	user, err := getUser(ctx.UserID)
 	if err != nil {
 		log.Printf("ユーザー取得エラー: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		ctx.Error("Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	if user == nil {
-		// 未登録ユーザー
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"userId":      userID,
-			"displayName": displayName,
+		ctx.Success(map[string]interface{}{
+			"userId":      ctx.UserID,
+			"displayName": ctx.DisplayName,
 			"registered":  false,
 		})
 		return
 	}
 
-	// 登録済みユーザー
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	ctx.Success(map[string]interface{}{
 		"userId":      user.UserID,
 		"name":        user.Name,
-		"displayName": displayName,
+		"displayName": ctx.DisplayName,
 		"circle":      user.Circle,
 		"registered":  true,
 		"step":        user.Step,
 	})
 }
 
-// ========== イベント管理API（新規） ==========
+// ========== イベント管理API ==========
 
-// イベント管理エンドポイント（GET: 一覧取得、POST: 作成）
-func handleEvents(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := authenticateRequest(r)
-	if err != nil {
-		log.Printf("認証エラー: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	switch r.Method {
+// handleEvents はイベント管理エンドポイント
+func handleEvents(ctx *APIContext) {
+	switch ctx.Request.Method {
 	case "GET":
-		// 自分が作成したイベント一覧を取得
-		getMyEvents(w, userID)
+		getMyEvents(ctx)
 	case "POST":
-		// 新しいイベントを作成
-		createEvent(w, r, userID)
+		createEvent(ctx)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		ctx.Error("Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// 自分が作成したイベント一覧を取得
-func getMyEvents(w http.ResponseWriter, userID string) {
+// getMyEvents は自分が作成したイベント一覧を取得
+func getMyEvents(ctx *APIContext) {
 	rows, err := db.Query(`
 		SELECT id, event_name, total_amount, split_amount, status, created_at
 		FROM events
 		WHERE organizer_id = $1
 		ORDER BY created_at DESC
-	`, userID)
+	`, ctx.UserID)
 
 	if err != nil {
 		log.Printf("イベント取得エラー: %v", err)
-		http.Error(w, "Failed to get events", http.StatusInternalServerError)
+		ctx.Error("Failed to get events", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -296,62 +217,55 @@ func getMyEvents(w http.ResponseWriter, userID string) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ok",
+	ctx.Success(map[string]interface{}{
 		"events": events,
 	})
 }
 
-// 新しいイベントを作成
-func createEvent(w http.ResponseWriter, r *http.Request, userID string) {
+// createEvent は新しいイベントを作成
+func createEvent(ctx *APIContext) {
 	var req struct {
-		EventName     string   `json:"eventName"`
-		TotalAmount   int      `json:"totalAmount"`
+		EventName      string   `json:"eventName"`
+		TotalAmount    int      `json:"totalAmount"`
 		ParticipantIDs []string `json:"participantIds"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("JSONデコードエラー: %v", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	if !ctx.DecodeJSON(&req) {
 		return
 	}
 
 	// バリデーション
 	if req.EventName == "" {
-		http.Error(w, "Event name is required", http.StatusBadRequest)
+		ctx.Error("Event name is required", http.StatusBadRequest)
 		return
 	}
 	if req.TotalAmount <= 0 {
-		http.Error(w, "Total amount must be positive", http.StatusBadRequest)
+		ctx.Error("Total amount must be positive", http.StatusBadRequest)
 		return
 	}
 	if len(req.ParticipantIDs) == 0 {
-		http.Error(w, "At least one participant is required", http.StatusBadRequest)
+		ctx.Error("At least one participant is required", http.StatusBadRequest)
 		return
 	}
 
-	// ユーザー情報を取得
-	organizer, err := getUser(userID)
+	organizer, err := getUser(ctx.UserID)
 	if err != nil || organizer == nil {
-		http.Error(w, "User not found", http.StatusBadRequest)
+		ctx.Error("User not found", http.StatusBadRequest)
 		return
 	}
 
-	// 割り勘金額を計算
 	splitAmount := req.TotalAmount / len(req.ParticipantIDs)
 
-	// イベントを作成
 	var eventID int
 	err = db.QueryRow(`
 		INSERT INTO events (event_name, organizer_id, circle, total_amount, split_amount, status)
 		VALUES ($1, $2, $3, $4, $5, 'confirmed')
 		RETURNING id
-	`, req.EventName, userID, organizer.Circle, req.TotalAmount, splitAmount).Scan(&eventID)
+	`, req.EventName, ctx.UserID, organizer.Circle, req.TotalAmount, splitAmount).Scan(&eventID)
 
 	if err != nil {
 		log.Printf("イベント作成エラー: %v", err)
-		http.Error(w, "Failed to create event", http.StatusInternalServerError)
+		ctx.Error("Failed to create event", http.StatusInternalServerError)
 		return
 	}
 
@@ -389,50 +303,39 @@ func createEvent(w http.ResponseWriter, r *http.Request, userID string) {
 
 	log.Printf("イベント作成成功: %s (ID: %d)", req.EventName, eventID)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
+	ctx.Success(map[string]interface{}{
 		"eventId": eventID,
 		"message": "イベントを作成しました",
 	})
 }
 
-// ========== 承認管理API（新規） ==========
+// ========== 承認管理API ==========
 
-// 承認管理エンドポイント
-func handleApprovals(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := authenticateRequest(r)
-	if err != nil {
-		log.Printf("認証エラー: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	switch r.Method {
+// handleApprovals は承認管理エンドポイント
+func handleApprovals(ctx *APIContext) {
+	switch ctx.Request.Method {
 	case "GET":
-		// 承認待ちの支払い一覧を取得
-		getPendingApprovals(w, userID)
+		getPendingApprovals(ctx)
 	case "POST":
-		// 支払いを承認
-		approvePayments(w, r, userID)
+		approvePayments(ctx)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		ctx.Error("Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// 承認待ちの支払い一覧を取得
-func getPendingApprovals(w http.ResponseWriter, userID string) {
+// getPendingApprovals は承認待ちの支払い一覧を取得
+func getPendingApprovals(ctx *APIContext) {
 	rows, err := db.Query(`
 		SELECT ep.id, ep.event_id, ep.user_id, ep.user_name, e.event_name, e.split_amount, ep.reported_at
 		FROM event_participants ep
 		JOIN events e ON ep.event_id = e.id
 		WHERE e.organizer_id = $1 AND ep.paid = true AND ep.approved_at IS NULL
 		ORDER BY ep.reported_at DESC
-	`, userID)
+	`, ctx.UserID)
 
 	if err != nil {
 		log.Printf("承認一覧取得エラー: %v", err)
-		http.Error(w, "Failed to get approvals", http.StatusInternalServerError)
+		ctx.Error("Failed to get approvals", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -460,33 +363,27 @@ func getPendingApprovals(w http.ResponseWriter, userID string) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "ok",
+	ctx.Success(map[string]interface{}{
 		"approvals": approvals,
 	})
 }
 
-// 支払いを承認
-func approvePayments(w http.ResponseWriter, r *http.Request, userID string) {
+// approvePayments は支払いを承認
+func approvePayments(ctx *APIContext) {
 	var req struct {
 		ParticipantIDs []int `json:"participantIds"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("JSONデコードエラー: %v", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	if !ctx.DecodeJSON(&req) {
 		return
 	}
 
 	if len(req.ParticipantIDs) == 0 {
-		http.Error(w, "No participants specified", http.StatusBadRequest)
+		ctx.Error("No participants specified", http.StatusBadRequest)
 		return
 	}
 
-	// 承認処理
 	for _, participantID := range req.ParticipantIDs {
-		// 承認権限を確認
 		var organizerID string
 		err := db.QueryRow(`
 			SELECT e.organizer_id
@@ -500,12 +397,11 @@ func approvePayments(w http.ResponseWriter, r *http.Request, userID string) {
 			continue
 		}
 
-		if organizerID != userID {
-			log.Printf("承認権限なし: %s", userID)
+		if organizerID != ctx.UserID {
+			log.Printf("承認権限なし: %s", ctx.UserID)
 			continue
 		}
 
-		// 承認実行
 		_, err = db.Exec(`
 			UPDATE event_participants
 			SET approved_at = NOW()
@@ -518,7 +414,7 @@ func approvePayments(w http.ResponseWriter, r *http.Request, userID string) {
 		}
 
 		// 承認通知を送信（非同期）
-		go func(pid int) {
+		go func(pid int, organizerUserID string) {
 			var participantUserID, participantName, eventName string
 			var splitAmount int
 
@@ -529,52 +425,41 @@ func approvePayments(w http.ResponseWriter, r *http.Request, userID string) {
 				WHERE ep.id = $1
 			`, pid).Scan(&participantUserID, &participantName, &eventName, &splitAmount)
 
-			organizer, _ := getUser(userID)
+			organizer, _ := getUser(organizerUserID)
 			if organizer != nil {
 				notifyText := fmt.Sprintf("【支払い承認】\n%sさんが支払いを承認しました。\n\nイベント: %s\n金額: %d円\n\nありがとうございました！",
 					organizer.Name, eventName, splitAmount)
 				PushMessage(participantUserID, notifyText)
 				log.Printf("承認通知送信: %s", participantName)
 			}
-		}(participantID)
+		}(participantID, ctx.UserID)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
+	ctx.Success(map[string]interface{}{
 		"message": "承認しました",
 	})
 }
 
-// ========== サークルメンバー取得API（新規） ==========
+// ========== サークルメンバー取得API ==========
 
-// 同じサークルのメンバー一覧を取得
-func handleGetCircleMembers(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := authenticateRequest(r)
-	if err != nil {
-		log.Printf("認証エラー: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// 自分のサークルを取得
-	user, err := getUser(userID)
+// handleGetCircleMembers は同じサークルのメンバー一覧を取得
+func handleGetCircleMembers(ctx *APIContext) {
+	user, err := getUser(ctx.UserID)
 	if err != nil || user == nil {
-		http.Error(w, "User not found", http.StatusBadRequest)
+		ctx.Error("User not found", http.StatusBadRequest)
 		return
 	}
 
-	// 同じサークルのメンバーを取得
 	rows, err := db.Query(`
 		SELECT user_id, name, circle
 		FROM users
 		WHERE circle = $1 AND step = 3 AND user_id != $2
 		ORDER BY name
-	`, user.Circle, userID)
+	`, user.Circle, ctx.UserID)
 
 	if err != nil {
 		log.Printf("メンバー取得エラー: %v", err)
-		http.Error(w, "Failed to get members", http.StatusInternalServerError)
+		ctx.Error("Failed to get members", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -594,9 +479,7 @@ func handleGetCircleMembers(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
+	ctx.Success(map[string]interface{}{
 		"members": members,
 	})
 }
