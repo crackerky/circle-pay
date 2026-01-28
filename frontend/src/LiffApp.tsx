@@ -4,6 +4,7 @@ import type { ErrorInfo, ReactNode } from 'react';
 import CreateEvent from './pages/CreateEvent';
 import ApprovePage from './pages/ApprovePage';
 import EventsPage from './pages/EventsPage';
+import CirclesPage from './pages/CirclesPage';
 
 // エラー境界コンポーネント
 interface ErrorBoundaryState {
@@ -54,6 +55,7 @@ export default function LiffApp() {
           <Route path="/events" element={<EventsPage />} />
           <Route path="/create" element={<CreateEvent />} />
           <Route path="/approve" element={<ApprovePage />} />
+          <Route path="/circles" element={<CirclesPage />} />
         </Routes>
       </BrowserRouter>
     </ErrorBoundary>

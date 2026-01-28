@@ -122,3 +122,105 @@ export async function approvePayments(accessToken: string, participantIds: numbe
     accessToken,
   });
 }
+
+// ========== サークル関連 ==========
+
+export interface Circle {
+  id: number;
+  name: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface CircleMember {
+  userId: string;
+  name: string;
+  joinedAt: string;
+}
+
+// 自分が所属するサークル一覧を取得
+export async function getMyCircles(accessToken: string): Promise<{
+  status: string;
+  circles: Circle[];
+  primaryCircleId: number | null;
+}> {
+  return apiCall('/api/liff/circles', { accessToken });
+}
+
+// サークルを新規作成
+export async function createCircle(accessToken: string, name: string): Promise<{
+  status: string;
+  message: string;
+  circle: Circle;
+}> {
+  return apiCall('/api/liff/circles', {
+    method: 'POST',
+    body: { name },
+    accessToken,
+  });
+}
+
+// 既存サークルに参加
+export async function joinCircle(accessToken: string, circleName?: string, circleId?: number): Promise<{
+  status: string;
+  message: string;
+  circle: Circle;
+}> {
+  return apiCall('/api/liff/circles/join', {
+    method: 'POST',
+    body: { circleName, circleId },
+    accessToken,
+  });
+}
+
+// サークルを検索
+export async function searchCircles(accessToken: string, query: string): Promise<{
+  status: string;
+  circles: Circle[];
+}> {
+  return apiCall(`/api/liff/circles/search?q=${encodeURIComponent(query)}`, { accessToken });
+}
+
+// サークルから退出
+export async function leaveCircle(accessToken: string, circleId: number): Promise<{
+  status: string;
+  message: string;
+}> {
+  return apiCall(`/api/liff/circles/${circleId}/leave`, {
+    method: 'POST',
+    accessToken,
+  });
+}
+
+// メンバーをサークルから退会させる
+export async function removeFromCircle(accessToken: string, circleId: number, targetUserId: string): Promise<{
+  status: string;
+  message: string;
+}> {
+  return apiCall(`/api/liff/circles/${circleId}/remove`, {
+    method: 'POST',
+    body: { targetUserId },
+    accessToken,
+  });
+}
+
+// サークルのメンバー一覧を取得
+export async function getCircleMembersByCircleId(accessToken: string, circleId: number, excludeMyself = false): Promise<{
+  status: string;
+  circle: Circle;
+  members: CircleMember[];
+}> {
+  const params = excludeMyself ? '?excludeMyself=true' : '';
+  return apiCall(`/api/liff/circles/${circleId}/members${params}`, { accessToken });
+}
+
+// 主サークルを設定
+export async function setPrimaryCircle(accessToken: string, circleId: number): Promise<{
+  status: string;
+  message: string;
+}> {
+  return apiCall(`/api/liff/circles/${circleId}/primary`, {
+    method: 'POST',
+    accessToken,
+  });
+}

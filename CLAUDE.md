@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 CirclePay is a hybrid LINE Bot + LIFF application for expense splitting in student circles/clubs. The system enables:
 - **Organizers**: Use LIFF web app to create events, select participants, and approve payments
 - **Participants**: Use LINE Bot with Quick Reply buttons to report payments
-- **Architecture**: Go backend + React/TypeScript LIFF frontend + PostgreSQL database
+- **Architecture**: Go backend (Gin framework) + React/TypeScript LIFF frontend + PostgreSQL database
 
 ## Development Commands
 
-### Backend (Go)
+### Backend (Go + Gin)
 ```bash
 cd backend
 
@@ -46,7 +46,7 @@ npm run preview
 ```
 
 ### Database
-PostgreSQL tables are created automatically on backend startup via `createTables()` in `main.go`.
+PostgreSQL tables are created automatically on backend startup via `createTables()` in `db.go`.
 
 ## Architecture
 
@@ -55,7 +55,7 @@ PostgreSQL tables are created automatically on backend startup via `createTables
 **LINE Bot (Quick Reply buttons)**:
 - Used by participants to report payments
 - Interactive buttons replace text commands
-- Implemented in `backend/bot.go`
+- Implemented in `backend/handler_bot.go`
 
 **LIFF App (Web interface)**:
 - Used by organizers to create events and approve payments
@@ -65,31 +65,119 @@ PostgreSQL tables are created automatically on backend startup via `createTables
 
 **Key principle**: Organizers use feature-rich web UI, participants use simple bot interactions.
 
-### Backend Structure (Go)
+### Backend Structure (Go + Gin) - Layered Architecture
 
-Backend is split into three files:
+```
+backend/
+├── main.go              # Entry point only
+├── models.go            # All data structures (User, Event, Participant, etc.)
+├── util.go              # Utility functions (sanitizeInput, formatAmount)
+│
+├── db.go                # Database connection and table creation
+├── user_repo.go         # User CRUD operations
+├── event_repo.go        # Event CRUD operations
+├── participant_repo.go  # Participant CRUD operations
+├── message_repo.go      # Message CRUD operations
+│
+├── handler_bot.go       # LINE Bot webhook handler
+├── handler_liff.go      # LIFF API handlers
+├── handler_admin.go     # Admin API handlers
+│
+├── line_client.go       # LINE messaging API (Strategy Pattern)
+├── line_richmenu.go     # Rich menu management
+│
+├── middleware.go        # Authentication middleware
+├── router.go            # Gin router setup
+├── static.go            # Static file serving
+└── reminder.go          # Reminder scheduler
+```
 
-**`backend/main.go`** - Common infrastructure
-- Data models: `User`, `Event`, `Participant`
-- Database layer: `initDB()`, `createTables()`, CRUD functions
-- Routing setup
-- Static file serving (serves `../frontend/dist`)
+#### Layer Responsibilities
 
-**`backend/bot.go`** - LINE Bot functionality
-- Webhook handler: `handleWebhook()`
-- Quick Reply implementation: `QuickReplyButton`, `showMainMenu()`
-- Message handlers: `handleMessage()`, `handleRegisteredUserMessage()`
-- LINE API functions: `ReplyMessage()`, `PushMessage()`, `ReplyMessageWithQuickReply()`
-- User registration flow (Steps 1-3: Name → Circle → Complete)
-- Payment reporting flow for participants
+| Layer | Files | Responsibility |
+|-------|-------|----------------|
+| **Entry** | `main.go` | App initialization, server startup |
+| **Models** | `models.go` | Data structure definitions |
+| **Repository** | `*_repo.go` | Database operations (CRUD) |
+| **Handler** | `handler_*.go` | HTTP request/response handling |
+| **LINE Client** | `line_*.go` | LINE API communication |
+| **Infrastructure** | `middleware.go`, `router.go`, `static.go` | HTTP infrastructure |
 
-**`backend/liff.go`** - LIFF API endpoints
-- LIFF token verification: `verifyLIFFToken()`, `authenticateRequest()`
-- Event creation: `handleEvents()` POST endpoint with participant selection
-- Approval flow: `handleApprovals()` GET/POST endpoints
-- Circle member lookup: `handleGetCircleMembers()`
-- User info: `handleGetMyInfo()`
-- Registration: `handleRegisterUser()`
+#### File Details
+
+**`main.go`** - Entry point
+- Environment variable loading
+- Database initialization
+- Server startup
+
+**`models.go`** - All data structures
+- Domain models: `User`, `Event`, `Participant`, `UnpaidParticipant`
+- LINE structures: `WebhookRequest`, `QuickReplyButton`, `RichMenu`, etc.
+
+**`*_repo.go`** - Repository layer (database operations)
+- `user_repo.go`: `GetUser()`, `SaveUser()`, `UpdateUser()`, `GetAllUsers()`
+- `event_repo.go`: `GetEvent()`, `CreateEvent()`, `GetEventsByOrganizer()`
+- `participant_repo.go`: `CreateParticipant()`, `GetUnpaidParticipants()`, `ApproveParticipant()`
+- `message_repo.go`: `SaveMessage()`
+
+**`handler_bot.go`** - LINE Bot handlers
+- `handleWebhook()`: Webhook receiver
+- `handleMessage()`: Message routing
+- User registration flow (Steps 1-3)
+- Payment reporting flow
+
+**`handler_liff.go`** - LIFF API handlers
+- `handleRegisterUser()`, `handleGetMyInfo()`
+- `handleGetEvents()`, `handleCreateEvent()`
+- `handleGetApprovals()`, `handleApprovePayments()`
+- `handleGetCircleMembers()`
+
+**`handler_admin.go`** - Admin API handlers
+- `handleGetUsers()`, `handleAllMessages()`
+- `handleSend()`, `handleTestReminder()`
+- Rich menu management handlers
+
+**`line_client.go`** - LINE Messaging API (Strategy Pattern)
+- Delivery strategies: `ReplyDelivery`, `PushDelivery`, `MulticastDelivery`
+- Content types: `TextContent`, `QuickReplyContent`
+- Helper functions: `ReplyMessage()`, `PushMessage()`, etc.
+
+**`middleware.go`** - Authentication middleware
+- `LIFFAuthMiddleware()`: LIFF token verification
+- `AdminAuthMiddleware()`: API key validation
+- `LineSignatureMiddleware()`: Webhook signature verification
+
+### API Endpoints
+
+**LINE Bot** (signature validation):
+```
+POST /webhook              - LINE webhook receiver
+```
+
+**LIFF APIs** (LIFF token required):
+```
+POST /api/liff/register         - Register/update user
+POST /api/liff/message          - Save message
+GET  /api/liff/me               - Get user profile
+GET  /api/liff/events           - List events
+POST /api/liff/events           - Create event
+GET  /api/liff/approvals        - List pending approvals
+POST /api/liff/approvals        - Approve payments
+GET  /api/liff/circle/members   - Get circle members
+```
+
+**Admin APIs** (API key required via `X-API-Key` header):
+```
+GET  /api/admin/users                  - List users
+GET  /api/admin/messages               - List messages
+POST /api/admin/send                   - Send message to user
+POST /api/admin/test/send-reminders    - Trigger reminder manually
+GET  /api/admin/richmenu               - List rich menus
+POST /api/admin/richmenu               - Create rich menu
+POST /api/admin/richmenu/:id/image     - Upload rich menu image
+POST /api/admin/richmenu/:id/default   - Set default rich menu
+DELETE /api/admin/richmenu/:id         - Delete rich menu
+```
 
 ### Frontend Structure (React + TypeScript)
 
@@ -115,14 +203,14 @@ frontend/src/
 - `/approve` - Approve pending payments
 
 **Admin Panel**:
-- `/admin` - View users and send messages (testing only)
+- `/admin` - View users and send messages (requires API key)
 
 ### Key Design Patterns
 
+**Gin Middleware Pattern**: Authentication handled by middleware before handlers execute.
+
 **State Machine Pattern**: User interactions tracked by database state fields:
 - `User.Step`: Registration (0=unregistered, 1=name, 2=circle, 3=complete)
-- `User.SplitEventStep`: Event creation flow (unused in current LIFF design)
-- `User.ApprovalStep`: Approval flow (unused in current LIFF design)
 
 **Database-First State**: All state persisted to PostgreSQL immediately, no in-memory state.
 
@@ -135,7 +223,12 @@ frontend/src/
 2. If not logged in, redirects to LINE login
 3. After login, gets access token via `liff.getAccessToken()`
 4. All API calls include `Authorization: Bearer <token>` header
-5. Backend verifies token with LINE API before processing
+5. Backend `LIFFAuthMiddleware()` verifies token with LINE API
+
+**Admin Authentication**:
+1. Client includes `X-API-Key: <key>` header (or `?api_key=<key>` query param)
+2. Backend `AdminAuthMiddleware()` compares with `ADMIN_API_KEY` env var
+3. Returns 401 if missing or invalid
 
 ## Environment Variables
 
@@ -147,6 +240,9 @@ DATABASE_URL=postgres://user:pass@host:port/db?sslmode=disable
 PORT=8080
 LIFF_ID=2008577348-GDBXaBEr
 LIFF_URL=https://liff.line.me/2008577348-GDBXaBEr
+
+# Admin API authentication (required for /api/admin/* endpoints)
+ADMIN_API_KEY=your_secure_random_key
 ```
 
 **Frontend** (`frontend/.env`):
@@ -179,12 +275,8 @@ Indexes:
 
 Quick Reply buttons shown to registered users:
 - **💰 支払いました**: Report payment completion
+- **📊 状況確認**: Check payment status
 - **👤 会計者になる**: Opens LIFF app (organizer features)
-
-Legacy text commands (still work but not shown):
-- `割り勘`: Create event (deprecated, use LIFF)
-- `状況確認`: Check payment status (deprecated)
-- `承認`: Approve payments (deprecated, use LIFF)
 
 ## Development Workflow
 
@@ -211,6 +303,22 @@ cd backend && go run .
 
 **Important**: Backend must be run from `backend/` directory so static files are served from `../frontend/dist`.
 
+## Testing Admin API
+
+```bash
+# With API key header (recommended)
+curl -H "X-API-Key: your_key" http://localhost:8080/api/admin/users
+
+# With query parameter (for browser testing)
+curl "http://localhost:8080/api/admin/users?api_key=your_key"
+
+# Send message
+curl -H "X-API-Key: your_key" \
+     -H "Content-Type: application/json" \
+     -X POST http://localhost:8080/api/admin/send \
+     -d '{"userID":"U...","message":"Hello"}'
+```
+
 ## Common Issues
 
 **Loading screen stuck on LIFF app**:
@@ -232,9 +340,20 @@ cd backend && go run .
 - Check redirectUri is correct (should be current URL)
 - Verify LIFF token verification is working (check backend logs)
 
+**Admin API returns 401**:
+- Check `ADMIN_API_KEY` is set in `.env`
+- Ensure header is `X-API-Key` (case-sensitive)
+- Verify key matches exactly
+
+**Admin API returns 503**:
+- `ADMIN_API_KEY` environment variable is not set
+- Add it to `.env` and restart backend
+
 ## Security Considerations
 
 - **Input Sanitization**: `sanitizeInput()` escapes HTML and trims whitespace
 - **LIFF Token Verification**: Backend verifies all tokens with LINE OAuth API
+- **Admin API Protection**: API key required for all admin endpoints
+- **LINE Webhook Signature**: HMAC-SHA256 validation for webhook requests
 - **Authorization**: Approval endpoints check organizer identity
 - **Secrets**: `.env` files excluded from git
